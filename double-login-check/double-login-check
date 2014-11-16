@@ -1,0 +1,111 @@
+#!/bin/bash
+
+function containsElement() {
+  for e in $2; do [ "$e" = "$1" ] && return 0; done
+  return 1
+}
+
+function get_user_primary_group() {
+  local username=$1
+  /usr/sbin/sophomorix-user -u "$username" | grep PrimaryGroup | cut -d ":" -f2 | awk -F "  " ' { print $1 }' | sed 's/^ //g'
+}
+
+function get_user_fullname() {
+  local username=$1
+  /usr/sbin/sophomorix-user -u "$username" | grep Gecos | cut -d ":" -f2 | awk -F "  " ' { print $1 }' | sed 's/^ //g'
+}
+
+function get_samba_duplicate_logins() {
+  smbstatus -b | tail -n+5 | sed 's/  */;/g' | cut -d";" -f2 | sort | uniq -d
+}
+
+function get_samba_hosts_for_username() {
+  local username=$1
+  [ -z "$username" ] && return
+  smbstatus -b -u "$username" | tail -n +5 | grep -Eo '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | uniq | sed -e "s/\n/ /g"
+}
+
+function send_warning_to_user() {
+  host=$1
+  message=$2
+  ssh -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no "$host" "nohup sh -c 'export DISPLAY=:0 && zenity --warning --text=\"$2\" >/dev/null &'" && return 0
+  #try windows message thingdummy
+  return 1
+}
+
+function reboot_host() {
+  host=$1
+  ssh -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no "$host" "nohup reboot &"
+}
+
+function handle_duplicate_login() {
+  local username=$1
+  local hosts=$2
+
+  local primarygroup=$(get_user_primary_group "$username")
+  local fullname=$(get_user_fullname "$username")
+  
+  local hostcount=$(echo $hosts | wc -w) 
+
+  #reboot if warning has already been sent
+  if [ "$reboot" = "1" ] && [ -e "$statusdir/$username" ]; then
+    for host in "$hosts"; do
+      reboot_host "$host" && rm "$statusdir/$username"
+    done
+  return 0
+  fi
+
+  #send message to admin
+  local admin_notice="$fullname aus der Gruppe $primarygroup ist an $hostcount Rechnern angemeldet: $(echo $hosts | sed 's/ /, /g')"
+  echo -e "$admin_notice"
+  #cron logs are going to get mailed anyway
+  #echo -e "$admin_notice" | mail -s "Mehrfachanmeldung von $fullname, $primarygroup" "$target_email"
+
+  #send warnings to user
+  local notify=0
+  if [ "$reboot" = "1" ]; then
+    local notify=1
+    local user_notice="$fullname, du bist an $hostcount Rechnern gleichzeitig angemeldet.\n\nDas ist verboten. \n\nMelde dich sofort überall ab, wo du nicht persönlich dran sitzt.\n\nRechner an denen du angemeldet bist: $(echo $hosts | sed 's/ /, /g') \n\n\n Tust du das nicht sofort, werden alle diese Rechner in 1 Minute heruntergefahren..."
+  elif [ "$notify_user" = "1" ]; then
+    local notify=1
+    local user_notice="$fullname, du bist an $hostcount Rechnern gleichzeitig angemeldet.\n\nDas ist verboten. \n\nMelde dich sofort überall ab, wo du nicht persönlich dran sitzt.\n\nRechner an denen du angemeldet bist: $(echo $hosts | sed 's/ /, /g')"
+  fi
+
+  warning_sent=0
+  if [ "$notify" = 1 ]; then 
+    for host in "$hosts"; do
+      send_warning_to_user "$host" "$user_notice" && warning_sent=1
+    done 
+  fi
+  
+  if [ "$reboot" = "1" ] && [ "$warning_sent" = "1" ]; then
+    touch "$statusdir/$username"
+  fi
+}
+
+function run() {
+  mkdir -p "$statusdir"
+  if [[ "$(ls ${statusdir})" != "" ]]; then
+    #delete all user status files if they are older then five minutes
+    find "$statusdir" -cmin 5 -delete
+  fi
+  local duplicates=$(get_samba_duplicate_logins)
+  for username in $duplicates; do
+    containsElement "$username" "$allowed_users" && continue
+    local hosts=$(get_samba_hosts_for_username "$username")
+    local hostcount=$(echo $hosts | wc -w)
+    [[ "$hostcount" -lt 2 ]] && continue #there may be < 2 hosts at this point, as only now duplicate hosts are filtered out
+    handle_duplicate_login "$username" "$hosts"
+  done
+}
+
+set -o nounset
+
+allowed_users="pgmadmin user2 user3"
+target_email="root"
+reboot=0
+notify_user=1
+statusdir="/usr/local/lib/double-login-data"
+
+run
+
